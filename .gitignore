@@ -1,4 +1,3 @@
-# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,26 +6,13 @@ __pycache__/
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
-
-# Environment variables
 .env
 .env.local
-
-# Database
 *.db
 *.sqlite
-
-# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 .DS_Store
-
-# Logs
 *.log
-
-# Docker
-.dockerignore
