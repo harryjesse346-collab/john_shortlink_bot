@@ -6,10 +6,7 @@ import json
 from datetime import datetime
 from flask import Flask, request, jsonify, redirect, render_template_string
 import requests
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from urllib.parse import urlparse
-import re
 
 # Configure logging
 logging.basicConfig(
@@ -21,58 +18,100 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 
-# Environment Variables
+# ============= ENVIRONMENT VARIABLES WITH PROPER HANDLING =============
+
+# Get PORT with proper error handling
+PORT = os.environ.get('PORT')
+if PORT is None:
+    PORT = 5000
+    logger.info("PORT not set, using default 5000")
+else:
+    try:
+        PORT = int(PORT)
+        logger.info(f"PORT set to {PORT}")
+    except ValueError:
+        PORT = 5000
+        logger.warning(f"Invalid PORT value, using default 5000")
+
+# Get Telegram Token
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TELEGRAM_TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN is required!")
+    logger.error("❌ TELEGRAM_BOT_TOKEN is required!")
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+else:
+    logger.info("✅ TELEGRAM_BOT_TOKEN loaded")
 
+# Get Base URL
+BASE_URL = os.environ.get('BASE_URL')
+if not BASE_URL:
+    # Try Railway's public domain
+    railway_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+    if railway_domain:
+        BASE_URL = f"https://{railway_domain}"
+        logger.info(f"BASE_URL from Railway: {BASE_URL}")
+    else:
+        BASE_URL = f"http://localhost:{PORT}"
+        logger.info(f"BASE_URL set to: {BASE_URL}")
+
+# Other variables
 MONGODB_URI = os.environ.get('MONGODB_URI', 'mongodb://localhost:27017/')
 DATABASE_NAME = os.environ.get('DATABASE_NAME', 'shortlink_bot')
-BASE_URL = os.environ.get('BASE_URL', 'https://john-shortlink-bot.up.railway.app')
-PORT = int(os.environ.get('PORT', 5000))
+BOT_NAME = os.environ.get('BOT_NAME', "John's Shortlink Bot")
+BOT_USERNAME = os.environ.get('BOT_USERNAME', 'john_shortlink_bot')
+BOT_OWNER = os.environ.get('BOT_OWNER', '@john')
 
 # Telegram API
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 WEBHOOK_URL = f"{BASE_URL}/webhook"
 
-# In-memory fallback storage (used if MongoDB fails)
+# ============= IN-MEMORY STORAGE (Fallback) =============
 in_memory_links = {}
 in_memory_users = {}
 
-# MongoDB Connection with retry logic
-def get_mongo_connection():
-    """Establish MongoDB connection with retry logic"""
-    try:
-        client = MongoClient(
-            MONGODB_URI,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            socketTimeoutMS=5000
-        )
-        # Test connection
-        client.admin.command('ping')
-        logger.info("✅ Connected to MongoDB successfully")
-        return client
-    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-        logger.error(f"❌ MongoDB connection failed: {e}")
-        logger.warning("⚠️ Using in-memory storage as fallback")
-        return None
+# ============= MONGODB CONNECTION (Optional) =============
+mongo_client = None
+links_collection = None
+users_collection = None
 
-# Initialize MongoDB
-mongo_client = get_mongo_connection()
-if mongo_client:
+try:
+    from pymongo import MongoClient
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    
+    logger.info("Attempting to connect to MongoDB...")
+    client = MongoClient(
+        MONGODB_URI,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000
+    )
+    # Test connection
+    client.admin.command('ping')
+    mongo_client = client
     db = mongo_client[DATABASE_NAME]
     links_collection = db['links']
     users_collection = db['users']
-    # Create indexes for better performance
-    links_collection.create_index('short_code', unique=True)
-    links_collection.create_index('user_id')
-    users_collection.create_index('user_id', unique=True)
-else:
-    logger.warning("⚠️ Running with in-memory storage only")
+    
+    # Create indexes
+    try:
+        links_collection.create_index('short_code', unique=True)
+        links_collection.create_index('user_id')
+        users_collection.create_index('user_id', unique=True)
+        logger.info("✅ MongoDB indexes created")
+    except Exception as e:
+        logger.warning(f"⚠️ Index creation skipped: {e}")
+    
+    logger.info("✅ Connected to MongoDB successfully")
+except ImportError:
+    logger.warning("⚠️ pymongo not installed, using in-memory storage only")
+except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+    logger.warning(f"⚠️ MongoDB connection failed: {e}")
+    logger.warning("⚠️ Using in-memory storage as fallback")
+except Exception as e:
+    logger.warning(f"⚠️ MongoDB error: {e}")
+    logger.warning("⚠️ Using in-memory storage as fallback")
 
-# Helper Functions
+# ============= HELPER FUNCTIONS =============
+
 def generate_short_code(length=6):
     """Generate a random short code"""
     chars = string.ascii_letters + string.digits
@@ -82,17 +121,13 @@ def is_valid_url(url):
     """Validate if URL is properly formatted"""
     if not url:
         return False
-    # Remove whitespace
     url = url.strip()
-    # Add scheme if missing
     if not url.startswith(('http://', 'https://')):
         url = 'http://' + url
     try:
         result = urlparse(url)
-        # Check if it has a valid scheme and netloc
         if not result.scheme or not result.netloc:
             return False
-        # Check if it contains at least one dot (simple domain check)
         if '.' not in result.netloc:
             return False
         return True
@@ -119,7 +154,7 @@ def save_link(short_code, original_url, user_id, custom=False):
     }
     
     try:
-        if mongo_client:
+        if links_collection is not None:
             links_collection.insert_one(link_data)
             logger.info(f"✅ Link saved in MongoDB: {short_code}")
         else:
@@ -128,33 +163,40 @@ def save_link(short_code, original_url, user_id, custom=False):
         return link_data
     except Exception as e:
         logger.error(f"❌ Failed to save link: {e}")
-        return None
+        # Try in-memory as fallback
+        try:
+            in_memory_links[short_code] = link_data
+            logger.info(f"✅ Link saved in memory (fallback): {short_code}")
+            return link_data
+        except:
+            return None
 
 def get_link(short_code):
     """Retrieve link from database or in-memory storage"""
     try:
-        if mongo_client:
+        if links_collection is not None:
             link = links_collection.find_one({'short_code': short_code, 'is_active': True})
             if link:
-                # Convert ObjectId to string for JSON serialization
                 if '_id' in link:
                     link['_id'] = str(link['_id'])
                 return link
-        else:
-            if short_code in in_memory_links:
-                return in_memory_links[short_code]
+        # Check in-memory
+        if short_code in in_memory_links:
+            return in_memory_links[short_code]
     except Exception as e:
         logger.error(f"❌ Failed to retrieve link: {e}")
+        # Try in-memory as fallback
+        if short_code in in_memory_links:
+            return in_memory_links[short_code]
     return None
 
 def get_user_links(user_id, limit=10):
     """Get user's links"""
     try:
-        if mongo_client:
+        if links_collection is not None:
             links = list(links_collection.find(
                 {'user_id': str(user_id), 'is_active': True}
             ).sort('created_at', -1).limit(limit))
-            # Convert ObjectId to string
             for link in links:
                 if '_id' in link:
                     link['_id'] = str(link['_id'])
@@ -170,7 +212,7 @@ def get_user_links(user_id, limit=10):
 def increment_clicks(short_code):
     """Increment click count for a link"""
     try:
-        if mongo_client:
+        if links_collection is not None:
             result = links_collection.update_one(
                 {'short_code': short_code},
                 {'$inc': {'clicks': 1}}
@@ -183,6 +225,9 @@ def increment_clicks(short_code):
                 logger.info(f"✅ Click incremented in memory for {short_code}")
     except Exception as e:
         logger.error(f"❌ Failed to increment clicks: {e}")
+        # Try in-memory as fallback
+        if short_code in in_memory_links:
+            in_memory_links[short_code]['clicks'] += 1
 
 def save_user(user_id, username=None, first_name=None):
     """Save or update user information"""
@@ -194,8 +239,7 @@ def save_user(user_id, username=None, first_name=None):
     }
     
     try:
-        if mongo_client:
-            # Update if exists, insert if not
+        if users_collection is not None:
             result = users_collection.update_one(
                 {'user_id': str(user_id)},
                 {
@@ -203,8 +247,7 @@ def save_user(user_id, username=None, first_name=None):
                     '$setOnInsert': {
                         'first_seen': datetime.utcnow().isoformat(),
                         'links_created': 0
-                    },
-                    '$inc': {'links_created': 0}  # No increment on every visit
+                    }
                 },
                 upsert=True
             )
@@ -226,7 +269,7 @@ def save_user(user_id, username=None, first_name=None):
 def get_user_stats(user_id):
     """Get user statistics"""
     try:
-        if mongo_client:
+        if users_collection is not None:
             user = users_collection.find_one({'user_id': str(user_id)})
             if user:
                 if '_id' in user:
@@ -237,9 +280,12 @@ def get_user_stats(user_id):
                 return in_memory_users[str(user_id)]
     except Exception as e:
         logger.error(f"❌ Failed to get user stats: {e}")
+        if str(user_id) in in_memory_users:
+            return in_memory_users[str(user_id)]
     return None
 
-# Telegram API Functions
+# ============= TELEGRAM API FUNCTIONS =============
+
 def send_telegram_message(chat_id, text, reply_markup=None, parse_mode='HTML'):
     """Send message to Telegram"""
     payload = {
@@ -286,7 +332,8 @@ def answer_callback_query(callback_query_id, text=None, show_alert=False):
         logger.error(f"❌ Failed to answer callback: {e}")
         return None
 
-# Bot Handlers
+# ============= BOT HANDLERS =============
+
 def get_main_keyboard():
     """Get main inline keyboard"""
     return {
@@ -299,8 +346,7 @@ def get_main_keyboard():
                 {'text': '📝 My Links', 'callback_data': 'my_links'},
                 {'text': '❓ Help', 'callback_data': 'help'}
             ]
-        ],
-        'resize_keyboard': True
+        ]
     }
 
 def handle_start(chat_id, user_id, username=None, first_name=None):
@@ -308,7 +354,7 @@ def handle_start(chat_id, user_id, username=None, first_name=None):
     save_user(user_id, username, first_name)
     
     welcome_text = f"""
-👋 <b>Welcome to John's Shortlink Bot!</b>
+👋 <b>Welcome to {BOT_NAME}!</b>
 
 I can shorten any URL instantly and track all your links.
 
@@ -335,8 +381,8 @@ Let's get started! Send me a URL to shorten. 🚀
 
 def handle_help(chat_id):
     """Handle /help command"""
-    help_text = """
-📖 <b>How to use John's Shortlink Bot</b>
+    help_text = f"""
+📖 <b>How to use {BOT_NAME}</b>
 
 <b>1️⃣ Shorten URL (Automatic):</b>
    Just send me any URL and I'll generate a short link for you!
@@ -354,7 +400,7 @@ def handle_help(chat_id):
    Use /stats to see your usage statistics
 
 <b>5️⃣ Support:</b>
-   If you need help, contact the developer
+   Contact {BOT_OWNER} for help
 
 <b>📝 Note:</b>
 • Short codes are case-sensitive
@@ -371,7 +417,6 @@ def handle_stats(chat_id, user_id):
         send_telegram_message(chat_id, "📊 No statistics found. Create some links first! 🚀", get_main_keyboard())
         return
     
-    # Count user's links
     links_count = len(get_user_links(user_id, limit=1000))
     
     stats_text = f"""
@@ -400,7 +445,6 @@ def handle_my_links(chat_id, user_id):
         message += f"<b>{idx}.</b> 🔗 <a href='{short_url}'>{short_url}</a>\n"
         message += f"   ↳ Clicks: <b>{link.get('clicks', 0)}</b>\n"
         message += f"   ↳ Created: {created_date}\n"
-        # Show original URL if not too long
         original = link.get('original_url', '')
         if len(original) > 40:
             original = original[:40] + '...'
@@ -435,15 +479,12 @@ def handle_custom_shortcode(chat_id, user_id, args):
     url = args[0]
     short_code = args[1]
     
-    # Validate URL
     if not is_valid_url(url):
         send_telegram_message(chat_id, "❌ Invalid URL. Please check and try again.", get_main_keyboard())
         return
     
-    # Normalize URL
     url = normalize_url(url)
     
-    # Validate short code
     if len(short_code) < 3 or len(short_code) > 10:
         send_telegram_message(chat_id, "❌ Short code must be 3-10 characters long.", get_main_keyboard())
         return
@@ -452,13 +493,11 @@ def handle_custom_shortcode(chat_id, user_id, args):
         send_telegram_message(chat_id, "❌ Short code can only contain letters and numbers.", get_main_keyboard())
         return
     
-    # Check if code exists
     existing = get_link(short_code)
     if existing:
         send_telegram_message(chat_id, f"❌ Short code '<b>{short_code}</b>' is already taken. Please choose another.", get_main_keyboard())
         return
     
-    # Save the link
     link = save_link(short_code, url, user_id, custom=True)
     if not link:
         send_telegram_message(chat_id, "❌ Failed to create short link. Please try again later.", get_main_keyboard())
@@ -479,15 +518,12 @@ Share your short link with anyone! 🚀
 
 def handle_url(chat_id, user_id, text):
     """Handle URL shortening"""
-    # Validate URL
     if not is_valid_url(text):
         send_telegram_message(chat_id, "❌ Invalid URL. Please send a valid URL like: https://example.com", get_main_keyboard())
         return
     
-    # Normalize URL
     url = normalize_url(text)
     
-    # Generate short code (try up to 5 times to avoid collisions)
     short_code = None
     for attempt in range(5):
         code = generate_short_code()
@@ -500,13 +536,11 @@ def handle_url(chat_id, user_id, text):
         send_telegram_message(chat_id, "❌ Unable to generate a unique short code. Please try again.", get_main_keyboard())
         return
     
-    # Save the link
     link = save_link(short_code, url, user_id)
     if not link:
         send_telegram_message(chat_id, "❌ Failed to create short link. Please try again later.", get_main_keyboard())
         return
     
-    # Save user (increment link count)
     save_user(user_id)
     
     short_url = f"{BASE_URL}/{short_code}"
@@ -533,7 +567,6 @@ def handle_callback_query(callback_query):
     user_id = callback_query['from']['id']
     data = callback_query['data']
     
-    # Answer callback to remove loading state
     answer_callback_query(callback_id)
     
     if data == 'shorten':
@@ -545,17 +578,21 @@ def handle_callback_query(callback_query):
     elif data == 'help':
         handle_help(chat_id)
 
-# Flask Routes
+# ============= FLASK ROUTES =============
+
 @app.route('/', methods=['GET'])
 def home():
     """Homepage / Health check endpoint"""
     return jsonify({
         'status': '🟢 Online',
-        'bot': 'John Shortlink Bot',
+        'bot': BOT_NAME,
+        'username': BOT_USERNAME,
         'version': '2.0.0',
         'timestamp': datetime.utcnow().isoformat(),
         'webhook_url': WEBHOOK_URL,
-        'mongo_status': 'Connected' if mongo_client else '⚠️ Using memory storage'
+        'mongo_status': 'Connected' if mongo_client else '⚠️ Using memory storage',
+        'port': PORT,
+        'base_url': BASE_URL
     })
 
 @app.route('/health', methods=['GET'])
@@ -568,6 +605,7 @@ def health():
         'status': 'healthy',
         'mongo': mongo_status,
         'memory_links': links_count,
+        'port': PORT,
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -577,7 +615,6 @@ def redirect_to_url(short_code):
     link = get_link(short_code)
     
     if not link:
-        # Return a clean 404 page
         return render_template_string('''
             <!DOCTYPE html>
             <html>
@@ -599,10 +636,7 @@ def redirect_to_url(short_code):
             </html>
         '''), 404
     
-    # Increment click count
     increment_clicks(short_code)
-    
-    # Redirect to original URL
     return redirect(link['original_url'], 302)
 
 @app.route('/webhook', methods=['POST'])
@@ -610,9 +644,8 @@ def webhook():
     """Telegram webhook endpoint"""
     try:
         data = request.get_json()
-        logger.info(f"📨 Webhook received: {data}")
+        logger.info(f"📨 Webhook received")
         
-        # Process message
         if 'message' in data:
             message = data['message']
             chat_id = message['chat']['id']
@@ -620,11 +653,9 @@ def webhook():
             username = message['from'].get('username')
             first_name = message['from'].get('first_name')
             
-            # Process text messages
             if 'text' in message:
                 text = message['text'].strip()
                 
-                # Commands
                 if text.startswith('/start'):
                     handle_start(chat_id, user_id, username, first_name)
                 elif text.startswith('/help'):
@@ -637,7 +668,6 @@ def webhook():
                     args = text.split()[1:]
                     handle_custom_shortcode(chat_id, user_id, args)
                 else:
-                    # Try to shorten URL
                     if is_valid_url(text):
                         handle_url(chat_id, user_id, text)
                     else:
@@ -647,7 +677,6 @@ def webhook():
                             get_main_keyboard()
                         )
         
-        # Process callback queries
         elif 'callback_query' in data:
             callback_query = data['callback_query']
             handle_callback_query(callback_query)
@@ -683,12 +712,26 @@ def delete_webhook_endpoint():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# Setup webhook on startup
+@app.route('/webhook_info', methods=['GET'])
+def webhook_info():
+    """Get webhook info"""
+    try:
+        response = requests.get(
+            f"{TELEGRAM_API_URL}/getWebhookInfo",
+            timeout=10
+        )
+        return jsonify(response.json())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============= SETUP WEBHOOK =============
+
 def setup_webhook():
     """Set webhook URL"""
     try:
-        # First delete any existing webhook
-        requests.get(f"{TELEGRAM_API_URL}/deleteWebhook", timeout=5)
+        # Delete existing webhook
+        delete_response = requests.get(f"{TELEGRAM_API_URL}/deleteWebhook", timeout=5)
+        logger.info(f"📋 Delete webhook response: {delete_response.json()}")
         
         # Set new webhook
         response = requests.get(
@@ -706,9 +749,22 @@ def setup_webhook():
     except Exception as e:
         logger.error(f"❌ Webhook setup error: {e}")
 
-# Main entry point
+# ============= MAIN ENTRY POINT =============
+
 if __name__ == '__main__':
-    # Get webhook info on startup
+    logger.info("=" * 50)
+    logger.info(f"🚀 Starting {BOT_NAME}")
+    logger.info(f"📱 Username: @{BOT_USERNAME}")
+    logger.info(f"🌐 Base URL: {BASE_URL}")
+    logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
+    logger.info(f"🔌 Port: {PORT}")
+    logger.info(f"🗄️  MongoDB: {'Connected' if mongo_client else 'Memory Only'}")
+    logger.info("=" * 50)
+    
+    # Setup webhook
+    setup_webhook()
+    
+    # Get webhook info
     try:
         response = requests.get(f"{TELEGRAM_API_URL}/getWebhookInfo", timeout=5)
         info = response.json()
@@ -716,12 +772,6 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"❌ Failed to get webhook info: {e}")
     
-    # Setup webhook
-    setup_webhook()
-    
     # Start Flask app
-    logger.info(f"🚀 Starting bot on port {PORT}")
-    logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
-    logger.info(f"🌐 Base URL: {BASE_URL}")
-    
+    logger.info(f"✅ Bot is ready! Listening on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False)
