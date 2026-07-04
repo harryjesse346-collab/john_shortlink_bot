@@ -1,12 +1,11 @@
 {
-  "$schema": "https://railway.app/railway.schema.json",
   "build": {
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "numReplicas": 1,
+    "startCommand": "gunicorn app:app --timeout 120 --workers 2 --bind 0.0.0.0:$PORT",
+    "healthcheckPath": "/health",
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 5,
-    "startCommand": "gunicorn app:app --timeout 120 --workers 4 --bind 0.0.0.0:$PORT"
+    "restartPolicyMaxRetries": 10
   }
 }
